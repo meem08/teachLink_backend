@@ -1,7 +1,6 @@
-import { Injectable } from '@nestjs/common';
-import { EventEmitter2 } from '@nestjs/event-emitter';
+import { Injectable, Optional, Inject, forwardRef } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import { CACHE_EVENTS } from '../caching/caching.constants';
 import { Course, CourseStatus } from './entities/course.entity';
 import { CourseReview, ReviewDecision } from './entities/course-review.entity';
@@ -12,7 +11,7 @@ import {
   BulkOperationStatus,
   BulkOperationType,
 } from './entities/bulk-operation.entity';
-import { User } from '../users/entities/user.entity';
+import { User, UserRole, PRIVILEGED_ROLES } from '../users/entities/user.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { SubmitForReviewDto } from './dto/submit-for-review.dto';
@@ -29,7 +28,34 @@ import {
 } from './dto/bulk-operations.dto';
 import { PaginationQueryDto } from '../common/dto/pagination.dto';
 import { OffsetPaginatedResponse } from '../common/interfaces/pagination.interface';
-import { buildOffsetResponse } from '../common/utils/pagination.utils';
+
+import { PaginationService } from '../common/services/pagination.service';
+import { OutboxService } from '../common/events/outbox.service';
+import { AnalyticsService } from '../analytics/analytics.service';
+import { EventType } from '../analytics/entities/event.entity';
+
+function checkUserRole(user?: User, ...roleNames: UserRole[]): boolean {
+  if (!user) return false;
+  if (typeof user.hasRole === 'function') {
+    return user.hasRole(...roleNames);
+  }
+  const roles = (user as any).roles || [];
+  return roles.some((role: any) => {
+    const name = typeof role === 'string' ? role : role?.name;
+    return roleNames.includes(name as UserRole);
+  });
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  const error = err as any;
+  return (
+    error?.code === '23505' ||
+    error?.driverError?.code === '23505' ||
+    (typeof error?.message === 'string' && error.message.includes('unique'))
+  );
+}
+
+const MAX_VERSION_RETRIES = 1;
 
 /**
  * Maps a ReviewDecision to the resulting CourseStatus after the decision.
@@ -54,7 +80,13 @@ export class CoursesService {
     private readonly versionRepo: Repository<CourseVersion>,
     @InjectRepository(BulkOperation)
     private readonly bulkOpRepo: Repository<BulkOperation>,
-    private readonly eventEmitter: EventEmitter2,
+    private readonly outbox: OutboxService,
+    private readonly dataSource: DataSource,
+    @Optional()
+    private readonly paginationService: PaginationService = new PaginationService(),
+    @Inject(forwardRef(() => AnalyticsService))
+    @Optional()
+    private readonly analyticsService?: AnalyticsService,
   ) {}
 
   // ─── CRUD ────────────────────────────────────────────────────────────────────
@@ -73,29 +105,37 @@ export class CoursesService {
       }
     }
 
-    const course = this.courseRepo.create({
-      title: dto.title,
-      description: dto.description,
-      price: dto.price,
-      thumbnailUrl: dto.thumbnailUrl,
-      instructorId: instructor.id,
-      status: CourseStatus.DRAFT,
-      prerequisite,
+    return this.dataSource.transaction(async (manager) => {
+      const courseRepo = manager.getRepository(Course);
+      const versionRepo = manager.getRepository(CourseVersion);
+
+      const course = courseRepo.create({
+        title: dto.title,
+        description: dto.description,
+        price: dto.price,
+        thumbnailUrl: dto.thumbnailUrl,
+        instructorId: instructor.id,
+        status: CourseStatus.DRAFT,
+        prerequisite,
+      });
+      const saved = await courseRepo.save(course);
+
+      const version = versionRepo.create({
+        courseId: saved.id,
+        versionNumber: 1,
+        eventType: CourseVersionEventType.CREATED,
+        title: saved.title,
+        description: saved.description,
+        price: saved.price,
+        thumbnailUrl: saved.thumbnailUrl,
+        status: saved.status,
+      });
+      await versionRepo.save(version);
+      // Enlist the event in the SAME transaction so a rollback never leaves a
+      // ghost cache/search entry (issue #1221).
+      await this.outbox.enqueue(manager, CACHE_EVENTS.COURSE_CREATED, { id: saved.id });
+      return saved;
     });
-    const saved = await this.courseRepo.save(course);
-    const version = this.versionRepo.create({
-      courseId: saved.id,
-      versionNumber: 1,
-      eventType: CourseVersionEventType.CREATED,
-      title: saved.title,
-      description: saved.description,
-      price: saved.price,
-      thumbnailUrl: saved.thumbnailUrl,
-      status: saved.status,
-    });
-    await this.versionRepo.save(version);
-    this.eventEmitter.emit(CACHE_EVENTS.COURSE_CREATED, { id: saved.id });
-    return saved;
   }
 
   /**
@@ -105,35 +145,47 @@ export class CoursesService {
     requestingUser?: User,
     query?: PaginationQueryDto,
   ): Promise<OffsetPaginatedResponse<Course>> {
-    const page = query?.page ?? 1;
     const limit = query?.limit ?? 20;
-    const isPrivileged =
-      requestingUser &&
-      requestingUser.roles?.some((role) =>
-        ['admin', 'moderator'].includes(typeof role === 'string' ? role : role.name),
-      );
+    const isPrivileged = checkUserRole(requestingUser, ...PRIVILEGED_ROLES);
 
-    const where = isPrivileged ? {} : { status: CourseStatus.PUBLISHED };
-    const [data, total] = await this.courseRepo.findAndCount({
-      where,
-      order: { createdAt: 'DESC' },
-      skip: (page - 1) * limit,
-      take: limit,
-    });
+    const qb = this.courseRepo.createQueryBuilder('course');
+    if (!isPrivileged) {
+      qb.where('course.status = :status', { status: CourseStatus.PUBLISHED });
+    }
 
-    return buildOffsetResponse(data, total, page, limit);
+    const offset = query?.offset ?? (query?.cursor ? undefined : ((query?.page ?? 1) - 1) * limit);
+
+    return this.paginationService.paginate(
+      qb,
+      query?.cursor,
+      limit,
+      offset,
+      'createdAt',
+    ) as Promise<OffsetPaginatedResponse<Course>>;
   }
 
   /**
    * Returns a single course by ID.
    */
-  async findOne(id: string): Promise<Course> {
+  async findOne(id: string, requestingUser?: User): Promise<Course> {
     const course = await this.courseRepo.findOne({
       where: { id },
       relations: ['instructor', 'reviews', 'reviews.reviewer', 'prerequisite'],
     });
     if (!course) {
       throw new ResourceNotFoundException('Course', id);
+    }
+    if (this.analyticsService) {
+      this.analyticsService
+        .trackEvent({
+          eventType: EventType.COURSE_VIEW,
+          category: 'course',
+          action: 'view',
+          label: course.title,
+          properties: { courseId: course.id },
+          userId: requestingUser?.id,
+        })
+        .catch(() => {});
     }
     return course;
   }
@@ -142,43 +194,67 @@ export class CoursesService {
    * Updates mutable fields of a course. Only the owner, admin, or moderator may update.
    */
   async update(id: string, dto: UpdateCourseDto, requestingUser: User): Promise<Course> {
-    const course = await this.findOne(id);
-    this.assertOwnerOrPrivileged(course, requestingUser);
+    for (let attempt = 0; attempt <= MAX_VERSION_RETRIES; attempt++) {
+      try {
+        return await this.dataSource.transaction(async (manager) => {
+          const courseRepo = manager.getRepository(Course);
+          const versionRepo = manager.getRepository(CourseVersion);
 
-    if (dto.prerequisiteCourseId !== undefined) {
-      if (dto.prerequisiteCourseId === null) {
-        course.prerequisite = null;
-      } else {
-        const prerequisite = await this.courseRepo.findOne({
-          where: { id: dto.prerequisiteCourseId },
+          const course = await courseRepo.findOne({
+            where: { id },
+            lock: { mode: 'pessimistic_write' },
+            relations: ['instructor', 'reviews', 'reviews.reviewer', 'prerequisite'],
+          });
+          if (!course) {
+            throw new ResourceNotFoundException('Course', id);
+          }
+          this.assertOwnerOrPrivileged(course, requestingUser);
+
+          if (dto.prerequisiteCourseId !== undefined) {
+            if (dto.prerequisiteCourseId === null) {
+              course.prerequisite = null;
+            } else {
+              const prerequisite = await courseRepo.findOne({
+                where: { id: dto.prerequisiteCourseId },
+              });
+              if (!prerequisite) {
+                throw new ResourceNotFoundException(
+                  'Prerequisite course',
+                  dto.prerequisiteCourseId,
+                );
+              }
+              course.prerequisite = prerequisite;
+            }
+          }
+
+          Object.assign(course, dto, { prerequisite: course.prerequisite });
+          const saved = await courseRepo.save(course);
+          const previousVersion = await versionRepo.findOne({
+            where: { courseId: saved.id },
+            order: { versionNumber: 'DESC' },
+          });
+          const nextVersionNumber = previousVersion ? previousVersion.versionNumber + 1 : 1;
+          const version = versionRepo.create({
+            courseId: saved.id,
+            versionNumber: nextVersionNumber,
+            eventType: CourseVersionEventType.UPDATED,
+            title: saved.title,
+            description: saved.description,
+            price: saved.price,
+            thumbnailUrl: saved.thumbnailUrl,
+            status: saved.status,
+          });
+          await versionRepo.save(version);
+          await this.outbox.enqueue(manager, CACHE_EVENTS.COURSE_UPDATED, { id: saved.id });
+          return saved;
         });
-        if (!prerequisite) {
-          throw new ResourceNotFoundException('Prerequisite course', dto.prerequisiteCourseId);
+      } catch (err) {
+        if (attempt < MAX_VERSION_RETRIES && isUniqueViolation(err)) {
+          continue;
         }
-        course.prerequisite = prerequisite;
+        throw err;
       }
     }
-
-    Object.assign(course, dto, { prerequisite: course.prerequisite });
-    const saved = await this.courseRepo.save(course);
-    const previousVersion = await this.versionRepo.findOne({
-      where: { courseId: saved.id },
-      order: { versionNumber: 'DESC' },
-    });
-    const nextVersionNumber = previousVersion ? previousVersion.versionNumber + 1 : 1;
-    const version = this.versionRepo.create({
-      courseId: saved.id,
-      versionNumber: nextVersionNumber,
-      eventType: CourseVersionEventType.UPDATED,
-      title: saved.title,
-      description: saved.description,
-      price: saved.price,
-      thumbnailUrl: saved.thumbnailUrl,
-      status: saved.status,
-    });
-    await this.versionRepo.save(version);
-    this.eventEmitter.emit(CACHE_EVENTS.COURSE_UPDATED, { id: saved.id });
-    return saved;
   }
 
   /**
@@ -188,7 +264,7 @@ export class CoursesService {
     const course = await this.findOne(id);
     this.assertOwnerOrPrivileged(course, requestingUser);
     await this.courseRepo.softDelete(id);
-    this.eventEmitter.emit(CACHE_EVENTS.COURSE_DELETED, { id });
+    await this.outbox.enqueueStandalone(CACHE_EVENTS.COURSE_DELETED, { id });
   }
 
   // ─── WORKFLOW ─────────────────────────────────────────────────────────────────
@@ -210,7 +286,7 @@ export class CoursesService {
     course.status = CourseStatus.PENDING_REVIEW;
     course.submissionNote = dto.submissionNote ?? null;
     const saved = await this.courseRepo.save(course);
-    this.eventEmitter.emit(CACHE_EVENTS.COURSE_UPDATED, { id: saved.id });
+    await this.outbox.enqueueStandalone(CACHE_EVENTS.COURSE_UPDATED, { id: saved.id });
     return saved;
   }
 
@@ -230,7 +306,7 @@ export class CoursesService {
     const previousStatus = course.status;
     course.status = DECISION_TO_STATUS[dto.decision];
     await this.courseRepo.save(course);
-    this.eventEmitter.emit(CACHE_EVENTS.COURSE_UPDATED, { id: course.id });
+    await this.outbox.enqueueStandalone(CACHE_EVENTS.COURSE_UPDATED, { id: course.id });
 
     const review = this.reviewRepo.create({
       courseId: id,
@@ -277,28 +353,56 @@ export class CoursesService {
     versionNumber: number,
     requestingUser?: User,
   ): Promise<Course> {
-    const course = await this.findOne(id);
-    if (requestingUser) {
-      this.assertOwnerOrPrivileged(course, requestingUser);
+    for (let attempt = 0; attempt <= MAX_VERSION_RETRIES; attempt++) {
+      try {
+        return await this.dataSource.transaction(async (manager) => {
+          const courseRepo = manager.getRepository(Course);
+          const versionRepo = manager.getRepository(CourseVersion);
+
+          const course = await courseRepo.findOne({
+            where: { id },
+            lock: { mode: 'pessimistic_write' },
+            relations: ['instructor', 'reviews', 'reviews.reviewer', 'prerequisite'],
+          });
+          if (!course) {
+            throw new ResourceNotFoundException('Course', id);
+          }
+          if (requestingUser) {
+            this.assertOwnerOrPrivileged(course, requestingUser);
+          }
+
+          const version = await versionRepo.findOne({
+            where: { courseId: id, versionNumber },
+          });
+          if (!version) {
+            throw new ResourceNotFoundException('Course Version', `${versionNumber}`);
+          }
+
+          Object.assign(course, {
+            title: version.title,
+            description: version.description,
+            price: Number(version.price),
+            thumbnailUrl: version.thumbnailUrl,
+            status: version.status,
+            submissionNote: version.submissionNote,
+          });
+
+          const rolledBackCourse = await courseRepo.save(course);
+          await this.createVersionSnapshot(
+            rolledBackCourse,
+            requestingUser?.id,
+            CourseVersionEventType.ROLLEDBACK,
+            manager,
+          );
+          return rolledBackCourse;
+        });
+      } catch (err) {
+        if (attempt < MAX_VERSION_RETRIES && isUniqueViolation(err)) {
+          continue;
+        }
+        throw err;
+      }
     }
-    const version = await this.findVersion(id, versionNumber);
-
-    Object.assign(course, {
-      title: version.title,
-      description: version.description,
-      price: Number(version.price),
-      thumbnailUrl: version.thumbnailUrl,
-      status: version.status,
-      submissionNote: version.submissionNote,
-    });
-
-    const rolledBackCourse = await this.courseRepo.save(course);
-    await this.createVersionSnapshot(
-      rolledBackCourse,
-      requestingUser?.id,
-      CourseVersionEventType.ROLLEDBACK,
-    );
-    return rolledBackCourse;
   }
 
   private async findVersion(courseId: string, versionNumber: number): Promise<CourseVersion> {
@@ -315,8 +419,11 @@ export class CoursesService {
     course: Course,
     changedByUserId?: string,
     eventType: CourseVersionEventType = CourseVersionEventType.UPDATED,
+    manager?: EntityManager,
   ): Promise<CourseVersion> {
-    const previousVersion = await this.versionRepo.findOne({
+    const repo = manager ? manager.getRepository(CourseVersion) : this.versionRepo;
+
+    const previousVersion = await repo.findOne({
       where: { courseId: course.id },
       order: { versionNumber: 'DESC' },
     });
@@ -324,7 +431,7 @@ export class CoursesService {
     const versionNumber = previousVersion ? previousVersion.versionNumber + 1 : 1;
     const changes = this.computeCourseChanges(previousVersion, course);
 
-    const courseVersion = this.versionRepo.create({
+    const courseVersion = repo.create({
       courseId: course.id,
       versionNumber,
       eventType,
@@ -338,7 +445,7 @@ export class CoursesService {
       changes: Object.keys(changes).length ? changes : null,
     });
 
-    return this.versionRepo.save(courseVersion);
+    return repo.save(courseVersion);
   }
 
   private computeCourseChanges(
@@ -390,20 +497,13 @@ export class CoursesService {
   }
 
   private assertPrivileged(user: User): void {
-    const isPrivileged = user.roles?.some((role) =>
-      ['admin', 'moderator'].includes(typeof role === 'string' ? role : role.name),
-    );
-    if (!isPrivileged) {
+    if (!user.hasRole(...PRIVILEGED_ROLES)) {
       throw new ForbiddenOperationException('Only admins or moderators may perform this action.');
     }
   }
 
   private assertOwnerOrPrivileged(course: Course, user: User): void {
-    const isOwner = course.instructorId === user.id;
-    const isPrivileged = user.roles?.some((role) =>
-      ['admin', 'moderator'].includes(typeof role === 'string' ? role : role.name),
-    );
-    if (!isOwner && !isPrivileged) {
+    if (course.instructorId !== user.id && !user.hasRole(...PRIVILEGED_ROLES)) {
       throw new ForbiddenOperationException('Insufficient permissions.');
     }
   }
@@ -500,9 +600,7 @@ export class CoursesService {
       throw new ResourceNotFoundException('Bulk operation', operationId);
     }
 
-    const isInitiator = op.initiatedById === user.id;
-    const isPrivileged = user.roles.some((role) => ['admin', 'moderator'].includes(role.name));
-    if (!isInitiator && !isPrivileged) {
+    if (op.initiatedById !== user.id && !checkUserRole(user, ...PRIVILEGED_ROLES)) {
       throw new ForbiddenOperationException(
         'Only the initiator or an admin/moderator may undo this operation.',
       );
@@ -542,7 +640,9 @@ export class CoursesService {
 
     if (restored.length > 0) {
       await this.courseRepo.save(restored);
-      restored.forEach((c) => this.eventEmitter.emit(CACHE_EVENTS.COURSE_UPDATED, { id: c.id }));
+      for (const c of restored) {
+        await this.outbox.enqueueStandalone(CACHE_EVENTS.COURSE_UPDATED, { id: c.id });
+      }
     }
 
     op.status = BulkOperationStatus.UNDONE;
@@ -563,7 +663,7 @@ export class CoursesService {
     apply: (course: Course) => BulkCourseSnapshot['previous'];
   }): Promise<BulkOperation> {
     const { type, payload, courseIds, user, apply } = args;
-    const isPrivileged = user.roles.some((role) => ['admin', 'moderator'].includes(role.name));
+    const isPrivileged = checkUserRole(user, ...PRIVILEGED_ROLES);
 
     const courses = await this.courseRepo.find({ where: { id: In(courseIds) } });
     const found = new Map(courses.map((c) => [c.id, c]));
@@ -598,7 +698,9 @@ export class CoursesService {
 
     if (toSave.length > 0) {
       await this.courseRepo.save(toSave);
-      toSave.forEach((c) => this.eventEmitter.emit(CACHE_EVENTS.COURSE_UPDATED, { id: c.id }));
+      for (const c of toSave) {
+        await this.outbox.enqueueStandalone(CACHE_EVENTS.COURSE_UPDATED, { id: c.id });
+      }
     }
 
     const successCount = snapshots.filter((s) => s.applied).length;

@@ -1,4 +1,5 @@
 import { AchievementType, AchievementDifficulty } from './entities/achievement.entity';
+import { Logger } from '@nestjs/common';
 
 /**
  * Seed data for default achievements

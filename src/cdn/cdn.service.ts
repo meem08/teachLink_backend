@@ -1,7 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { resolveCdnConfig, resolveCacheHeaderConfig } from './cdn.config';
 import { CloudFrontClient, CreateInvalidationCommand } from '@aws-sdk/client-cloudfront';
 import CircuitBreaker from 'opossum';
+import * as fileType from 'file-type';
 
 export interface CacheHeaders {
   'Cache-Control': string;
@@ -80,19 +81,17 @@ export class CdnService {
       `Invalidating ${paths.length} path(s) on distribution ${this.cdn.distributionId}: ${paths.join(', ')}`,
     );
 
-    // Placeholder: wire up AWS SDK CloudFront.createInvalidation here when credentials are available.
-    // Example:
-    //   const cf = new CloudFrontClient({});
-    //   await cf.send(new CreateInvalidationCommand({
-    //     DistributionId: this.cdn.distributionId,
-    //     InvalidationBatch: { Paths: { Quantity: paths.length, Items: paths }, CallerReference: Date.now().toString() },
-    //   }));
-
-    return {
-      success: true,
-      paths,
-      message: `Invalidation queued for distribution ${this.cdn.distributionId}`,
-    };
+    try {
+      await this.invalidationBreaker.fire(paths);
+      return {
+        success: true,
+        paths,
+        message: `Invalidation queued for distribution ${this.cdn.distributionId}`,
+      };
+    } catch (error: any) {
+      this.logger.error(`CloudFront invalidation failed: ${error.message}`, error.stack);
+      return { success: false, paths, message: 'CDN invalidation failed' };
+    }
   }
 
   /** Returns the CDN URL for a given asset path. */
@@ -103,5 +102,25 @@ export class CdnService {
 
   getConfig() {
     return { ...this.cdn, cacheHeaders: this.cacheHeaders };
+  }
+
+  /**
+   * Validates uploaded file size and magic bytes against expected MIME.
+   * Throws 413 Payload Too Large if size exceeds limits (500MB video, 10MB image).
+   * Throws 415 Unsupported Media Type if magic bytes do not match.
+   */
+  async validateUpload(buffer: Buffer, declaredMimeType: string): Promise<void> {
+    const isVideo = declaredMimeType.startsWith('video/');
+    const maxSize = isVideo ? 500 * 1024 * 1024 : 10 * 1024 * 1024;
+
+    if (buffer.length > maxSize) {
+      throw new HttpException('Payload Too Large', HttpStatus.PAYLOAD_TOO_LARGE);
+    }
+
+    const type = await fileType.fromBuffer(buffer);
+    if (!type || type.mime !== declaredMimeType) {
+      this.logger.warn(`MIME type mismatch: declared ${declaredMimeType}, detected ${type?.mime}`);
+      throw new HttpException('Unsupported Media Type', HttpStatus.UNSUPPORTED_MEDIA_TYPE);
+    }
   }
 }

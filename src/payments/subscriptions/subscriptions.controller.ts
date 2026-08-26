@@ -24,6 +24,7 @@ import {
   DowngradeSubscriptionDto,
 } from './dto/subscription-action.dto';
 import { Subscription } from '../entities/subscription.entity';
+import { Idempotent } from '../../common/decorators/idempotency.decorator';
 
 @ApiTags('Subscriptions')
 @Controller('subscriptions')
@@ -61,6 +62,21 @@ export class SubscriptionsController {
   @ApiResponse({ status: 404, description: 'Subscription not found' })
   async getSubscription(@Param('subscriptionId') subscriptionId: string): Promise<Subscription> {
     return this.subscriptionsService.getSubscription(subscriptionId);
+  }
+
+  /**
+   * Get subscription by ID, verifying ownership
+   */
+  @Get(':subscriptionId/ownership')
+  @ApiOperation({ summary: 'Get subscription by ID with ownership verification' })
+  @ApiParam({ name: 'subscriptionId', description: 'Subscription ID' })
+  @ApiResponse({ status: 200, description: 'Subscription', type: SubscriptionResponseDto })
+  @ApiResponse({ status: 404, description: 'Subscription not found for this user' })
+  async getSubscriptionForUser(
+    @Param('subscriptionId') subscriptionId: string,
+    @Request() req: any,
+  ): Promise<Subscription> {
+    return this.subscriptionsService.getSubscriptionForUser(subscriptionId, req.user.id);
   }
 
   /**
@@ -121,6 +137,7 @@ export class SubscriptionsController {
    * Upgrade a subscription
    */
   @Post(':subscriptionId/upgrade')
+  @Idempotent()
   @ApiOperation({ summary: 'Upgrade subscription to a higher plan' })
   @ApiParam({ name: 'subscriptionId', description: 'Subscription ID' })
   @ApiResponse({
@@ -148,6 +165,7 @@ export class SubscriptionsController {
    * Downgrade a subscription
    */
   @Post(':subscriptionId/downgrade')
+  @Idempotent()
   @ApiOperation({ summary: 'Downgrade subscription to a lower plan' })
   @ApiParam({ name: 'subscriptionId', description: 'Subscription ID' })
   @ApiResponse({
